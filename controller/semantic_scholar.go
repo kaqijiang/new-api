@@ -5,15 +5,22 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 )
 
+const SemanticScholarModelName = "semantic-scholar"
+
 // SemanticScholarProxy handles passthrough requests to Semantic Scholar API
 func SemanticScholarProxy(c *gin.Context) {
+	startTime := time.Now()
+
 	// Get the path after /s2/
 	path := c.Param("path")
 	apiType := c.GetString("api") // graph, recommendations, or datasets (set by router)
@@ -26,11 +33,58 @@ func SemanticScholarProxy(c *gin.Context) {
 
 	// Get the token from context (set by TokenAuth middleware)
 	tokenId := c.GetInt(string(constant.ContextKeyTokenId))
+	userId := c.GetInt(string(constant.ContextKeyUserId))
+	tokenKey := c.GetString(string(constant.ContextKeyTokenKey))
+	tokenUnlimited := c.GetBool(string(constant.ContextKeyTokenUnlimited))
+	tokenName := c.GetString("token_name")
+	group := c.GetString(string(constant.ContextKeyUsingGroup))
+
 	if tokenId == 0 {
 		c.JSON(http.StatusUnauthorized, gin.H{
 			"error": "unauthorized",
 		})
 		return
+	}
+
+	// Get model price and calculate quota
+	modelPrice, hasPrice := ratio_setting.GetModelPrice(SemanticScholarModelName, false)
+	if !hasPrice {
+		// Use default price if not configured (0.001 per call)
+		modelPrice = 0.001
+	}
+	groupRatio := ratio_setting.GetGroupRatio(group)
+	quota := int(modelPrice * common.QuotaPerUnit * groupRatio)
+
+	// Check user quota
+	userQuota, err := model.GetUserQuota(userId, false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to get user quota",
+		})
+		return
+	}
+	if userQuota < quota {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": fmt.Sprintf("用户额度不足，需要 %d，剩余 %d", quota, userQuota),
+		})
+		return
+	}
+
+	// Check token quota if not unlimited
+	if !tokenUnlimited {
+		token, err := model.GetTokenByKey(tokenKey, false)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error": "failed to get token",
+			})
+			return
+		}
+		if token.RemainQuota < quota {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": fmt.Sprintf("令牌额度不足，需要 %d，剩余 %d", quota, token.RemainQuota),
+			})
+			return
+		}
 	}
 
 	// Get a Semantic Scholar channel by type
@@ -122,7 +176,7 @@ func SemanticScholarProxy(c *gin.Context) {
 		}
 	}
 
-	// Read and write response body
+	// Read response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -131,27 +185,52 @@ func SemanticScholarProxy(c *gin.Context) {
 		return
 	}
 
-	// Log the request for quota tracking (async)
-	userId := c.GetInt(string(constant.ContextKeyUserId))
-	tokenName := c.GetString("token_name")
-	group := c.GetString(string(constant.ContextKeyUsingGroup))
-	go func() {
-		logContent := fmt.Sprintf("S2 API: %s %s", c.Request.Method, fullPath)
-		model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
-			ChannelId:        channel.Id,
-			PromptTokens:     0,
-			CompletionTokens: 0,
-			ModelName:        "semantic-scholar",
-			TokenName:        tokenName,
-			Quota:            0,
-			Content:          logContent,
-			TokenId:          tokenId,
-			UseTimeSeconds:   0,
-			IsStream:         false,
-			Group:            group,
-			Other:            nil,
-		})
-	}()
+	// Calculate use time
+	useTimeSeconds := int(time.Since(startTime).Seconds())
+
+	// Only charge if upstream request was successful (2xx status code)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && quota > 0 {
+		// Deduct user quota
+		err = model.DecreaseUserQuota(userId, quota)
+		if err != nil {
+			// Log error but don't fail the request
+			common.SysError(fmt.Sprintf("failed to decrease user quota: %v", err))
+		}
+
+		// Deduct token quota if not unlimited
+		if !tokenUnlimited {
+			err = model.DecreaseTokenQuota(tokenId, tokenKey, quota)
+			if err != nil {
+				common.SysError(fmt.Sprintf("failed to decrease token quota: %v", err))
+			}
+		}
+
+		// Update statistics
+		model.UpdateUserUsedQuotaAndRequestCount(userId, quota)
+		model.UpdateChannelUsedQuota(channel.Id, quota)
+	} else if resp.StatusCode >= 400 {
+		// Request failed, don't charge
+		quota = 0
+	}
+
+	// Log the request
+	logContent := fmt.Sprintf("S2 API: %s %s, 状态码: %d, 模型价格: %.4f, 分组倍率: %.2f",
+		c.Request.Method, fullPath, resp.StatusCode, modelPrice, groupRatio)
+
+	model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
+		ChannelId:        channel.Id,
+		PromptTokens:     0,
+		CompletionTokens: 0,
+		ModelName:        SemanticScholarModelName,
+		TokenName:        tokenName,
+		Quota:            quota,
+		Content:          logContent,
+		TokenId:          tokenId,
+		UseTimeSeconds:   useTimeSeconds,
+		IsStream:         false,
+		Group:            group,
+		Other:            nil,
+	})
 
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 }
