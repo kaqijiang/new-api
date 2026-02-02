@@ -355,6 +355,25 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 	return channel, nil
 }
 
+// GetEnabledChannelByType returns a random enabled channel of the specified type
+func GetEnabledChannelByType(channelType int) (*Channel, error) {
+	var channels []*Channel
+	err := DB.Where("type = ? AND status = 1", channelType).Order("priority desc").Find(&channels).Error
+	if err != nil {
+		return nil, err
+	}
+	if len(channels) == 0 {
+		return nil, errors.New("no enabled channel found for this type")
+	}
+	// If multiple channels, use weighted random selection
+	if len(channels) == 1 {
+		return channels[0], nil
+	}
+	// Simple random selection for now
+	randomIndex := rand.Intn(len(channels))
+	return channels[randomIndex], nil
+}
+
 func BatchInsertChannels(channels []Channel) error {
 	if len(channels) == 0 {
 		return nil
