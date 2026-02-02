@@ -26,7 +26,7 @@ func SemanticScholarProxy(c *gin.Context) {
 	apiType := c.GetString("api") // graph, recommendations, or datasets (set by router)
 
 	// Build the full path
-	fullPath := fmt.Sprintf("/%s/v1%s", apiType, path)
+	fullPath := fmt.Sprintf("/%s%s", apiType, path)
 	if c.Request.URL.RawQuery != "" {
 		fullPath += "?" + c.Request.URL.RawQuery
 	}
@@ -50,7 +50,7 @@ func SemanticScholarProxy(c *gin.Context) {
 	modelPrice, hasPrice := ratio_setting.GetModelPrice(SemanticScholarModelName, false)
 	if !hasPrice {
 		// Use default price if not configured (0.001 per call)
-		modelPrice = 0.001
+		modelPrice = 0.1
 	}
 	groupRatio := ratio_setting.GetGroupRatio(group)
 	quota := int(modelPrice * common.QuotaPerUnit * groupRatio)
@@ -217,6 +217,16 @@ func SemanticScholarProxy(c *gin.Context) {
 	logContent := fmt.Sprintf("S2 API: %s %s, 状态码: %d, 模型价格: %.4f, 分组倍率: %.2f",
 		c.Request.Method, fullPath, resp.StatusCode, modelPrice, groupRatio)
 
+	// Build other info for log display (similar to MJ/Task)
+	other := map[string]interface{}{
+		"model_price":      modelPrice,
+		"group_ratio":      groupRatio,
+		"completion_ratio": 0.0,
+		"model_ratio":      0.0,
+		"per_call":         true,
+		"request_path":     c.Request.URL.Path,
+	}
+
 	model.RecordConsumeLog(c, userId, model.RecordConsumeLogParams{
 		ChannelId:        channel.Id,
 		PromptTokens:     0,
@@ -229,7 +239,7 @@ func SemanticScholarProxy(c *gin.Context) {
 		UseTimeSeconds:   useTimeSeconds,
 		IsStream:         false,
 		Group:            group,
-		Other:            nil,
+		Other:            other,
 	})
 
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
